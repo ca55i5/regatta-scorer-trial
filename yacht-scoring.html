@@ -1,0 +1,1266 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>REGATTA SCORER</title>
+<link href="https://fonts.googleapis.com/css2?family=Bebas+Neue&family=DM+Mono:wght@400;500&family=DM+Sans:wght@300;400;500&display=swap" rel="stylesheet">
+<script src="https://cdnjs.cloudflare.com/ajax/libs/html2canvas/1.4.1/html2canvas.min.js"></script>
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/flatpickr/dist/flatpickr.min.css">
+<script src="https://cdn.jsdelivr.net/npm/flatpickr"></script>
+<script type="module">
+import { initializeApp } from "https://www.gstatic.com/firebasejs/10.12.0/firebase-app.js";
+import { getFirestore, collection, doc, setDoc, getDoc, getDocs, deleteDoc, onSnapshot } from "https://www.gstatic.com/firebasejs/10.12.0/firebase-firestore.js";
+
+const firebaseConfig = {
+  apiKey: "AIzaSyARdwYIkMhLezO--Ld1iZ5_t_RJrgPO5ec",
+  authDomain: "regatta-scorer-trial.firebaseapp.com",
+  projectId: "regatta-scorer-trial",
+  storageBucket: "regatta-scorer-trial.firebasestorage.app",
+  messagingSenderId: "849242676040",
+  appId: "1:849242676040:web:bf6e1897f8f0b7eae0717d"
+};
+
+const app = initializeApp(firebaseConfig);
+const db  = getFirestore(app);
+
+// ── CONSTANTS ────────────────────────────────────────────────────────────────
+const PENALTY_STATUSES = ['DNS','DNC','OCS','DNF','RET','DSQ','BFD','UFD','DNE'];
+const NON_EXCLUDABLE   = ['DNE'];
+const CURRENT_DOC_ID   = '_current';
+
+// ── STATE ────────────────────────────────────────────────────────────────────
+// state は非モジュール側の var state を共有する（window.state）
+let syncTimer        = null;
+let viewingEventId   = null;
+let unsubscribe      = null;
+
+// ── FIREBASE: save current ───────────────────────────────────────────────────
+function scheduleSave() {
+  setSyncStatus('saving','syncSaving');
+  clearTimeout(syncTimer);
+  syncTimer = setTimeout(async () => {
+    try {
+      await setDoc(doc(db,'events', CURRENT_DOC_ID), { ...window.state, _updatedAt: Date.now() });
+      setSyncStatus('ok','syncOk',new Date().toLocaleTimeString('ja-JP',{hour:'2-digit',minute:'2-digit'}));
+    } catch(e) {
+      setSyncStatus('err','syncErr',e.message);
+    }
+  }, 1200);
+}
+
+// ── THEME ─────────────────────────────────────────────────────────────────────
+function toggleTheme() {
+  const isLight = document.body.classList.toggle('light');
+  localStorage.setItem('theme', isLight ? 'light' : 'dark');
+  document.getElementById('themeToggleBtn').textContent = isLight ? '🌙' : '☀';
+}
+window.toggleTheme = toggleTheme;
+// テーマをbodyクラスに即時適用（ちらつき防止）
+if (localStorage.getItem('theme') === 'light') {
+  document.body.classList.add('light');
+}
+// ボタンテキストはDOM構築後に適用
+document.addEventListener('DOMContentLoaded', function() {
+  if (localStorage.getItem('theme') === 'light') {
+    const btn = document.getElementById('themeToggleBtn');
+    if (btn) btn.textContent = '🌙';
+  }
+});
+
+// ── ADMIN AUTH ────────────────────────────────────────────────────────────────
+const ADMIN_PASS = '2026'; // ← ここを変更してください
+function checkAdmin() {
+  const input = prompt(t('promptPass'));
+  if (input === null) return false;
+  if (input === ADMIN_PASS) return true;
+  showToast(t('toastWrongPass'));
+  return false;
+}
+
+// ── FIREBASE: save as named event ─────────────────────────────────────────────
+async function saveAsEvent() {
+  if (!checkAdmin()) return;
+  const name = window.state.seriesName.trim();
+  if (!name) { showToast(t('toastNoName')); switchTab('setup'); return; }
+  const btn = document.getElementById('saveEventBtn');
+  btn.disabled = true; btn.textContent = '保存中...';
+  try {
+    const id = 'evt_' + Date.now();
+    await setDoc(doc(db,'events', id), { ...window.state, _savedAt: Date.now() });
+    setSyncStatus('ok','syncConnected');
+    showToast(t('toastSaved'));
+    renderEventList();
+  } catch(e) { showToast(t('toastSaveFail')+e.message); }
+  finally { btn.disabled=false; btn.textContent='💾 大会として保存'; }
+}
+
+// ── FIREBASE: load event list ─────────────────────────────────────────────────
+async function renderEventList() {
+  const el = document.getElementById('eventList');
+  el.innerHTML = `<div class="drive-status"><span class="drive-spinner"></span>${t('cloudLoading')}</div>`;
+  try {
+    const snap = await getDocs(collection(db,'events'));
+    const events = [];
+    snap.forEach(d => { if (d.id !== CURRENT_DOC_ID) events.push({id:d.id,...d.data()}); });
+    events.sort((a,b)=>(a.dateFrom||'').localeCompare(b.dateFrom||''));
+    if (events.length===0) { el.innerHTML=`<div class="drive-status">${t('cloudEmpty')}</div>`; return; }
+    el.innerHTML = events.map(ev => {
+      const from = ev.dateFrom||'';
+      const to   = ev.dateTo||'';
+      const ds   = from ? (to && to!==from ? `${from} 〜 ${to}` : from) : '';
+      const raceCount = (ev.races||[]).length;
+      const boatCount = (ev.boats||[]).length;
+      return `<div class="drive-item" onclick="openViewEvent('${ev.id}')">
+        <span style="font-size:1.1rem">🏆</span>
+        <div style="flex:1;min-width:0;">
+          <div class="drive-item-name">${escHtml(ev.seriesName||t('noTitle'))}</div>
+          <div style="font-size:0.7rem;color:var(--muted);">${boatCount}${t('boatsCount')}${raceCount}${t('racesCount')}</div>
+        </div>
+        <span class="drive-item-date">${ds}</span>
+      </div>`;
+    }).join('');
+  } catch(e) {
+    el.innerHTML = `<div class="drive-status">${t('toastLoadFail')+e.message}</div>`;
+  }
+}
+
+// ── FIREBASE: view event ──────────────────────────────────────────────────────
+async function openViewEvent(id) {
+  viewingEventId = id;
+  document.getElementById('viewEventTitle').textContent = '読み込み中...';
+  document.getElementById('viewEventResults').innerHTML = '<div class="drive-status"><span class="drive-spinner"></span></div>';
+  document.getElementById('viewEventModal').classList.add('open');
+  try {
+    const snap = await getDoc(doc(db,'events',id));
+    if (!snap.exists()) { showToast(t('toastNotFound')); closeViewEvent(); return; }
+    const ev = snap.data();
+    migrateState(ev);
+    document.getElementById('viewEventTitle').textContent = ev.seriesName||'無題';
+    const html = buildResultsHTML(ev);
+    document.getElementById('viewEventResults').innerHTML = html||'<div class="drive-status">データなし</div>';
+  } catch(e) {
+    document.getElementById('viewEventResults').innerHTML = '<div class="drive-status">読み込み失敗</div>';
+  }
+}
+function closeViewEvent() { document.getElementById('viewEventModal').classList.remove('open'); viewingEventId=null; }
+
+async function loadViewEvent() {
+  if (!viewingEventId) return;
+  if (!confirm(t('confirmLoad'))) return;
+  try {
+    const snap = await getDoc(doc(db,'events',viewingEventId));
+    const ev = snap.data();
+    migrateState(ev);
+    window.state = ev;
+    delete window.state._savedAt; delete window.state._updatedAt;
+    localStorage.setItem('regattaScorer3', JSON.stringify(window.state));
+    applyStateToUI();
+    scheduleSave();
+    closeViewEvent();
+    closeCloudModal();
+    showToast(t('toastLoaded'));
+  } catch(e) { showToast(t('toastLoadFail')); }
+}
+
+async function deleteViewEvent() {
+  if (!viewingEventId) return;
+  if (!checkAdmin()) return;
+  const title = document.getElementById('viewEventTitle').textContent;
+  if (!confirm(t('confirmDeleteEvent').replace('{t}',title))) return;
+  try {
+    await deleteDoc(doc(db,'events',viewingEventId));
+    closeViewEvent();
+    renderEventList();
+    showToast(t('toastDeleted'));
+  } catch(e) { showToast(t('toastDeleteFail')); }
+}
+
+// リアルタイム同期（他の人が入力したら自動で反映）
+function startRealtimeSync() {
+  if (unsubscribe) unsubscribe();
+  unsubscribe = onSnapshot(doc(db,'events',CURRENT_DOC_ID), (snap) => {
+    if (!snap.exists()) return;
+    const remote = snap.data();
+    // 自分のsyncTimerが動いている間は無視（自分が書いている最中）
+    if (syncTimer) return;
+    const remoteTime = remote._updatedAt||0;
+    const localTime  = window.state._updatedAt||0;
+    if (remoteTime > localTime) {
+      migrateState(remote);
+      window.state = remote;
+      delete window.state._updatedAt;
+      localStorage.setItem('regattaScorer3', JSON.stringify(window.state));
+      applyStateToUI();
+      setSyncStatus('ok','syncOther');
+    }
+  }, (err) => {
+    setSyncStatus('err','syncError');
+  });
+}
+
+// 即時保存（リセット時などデバウンスなしで使う）
+async function saveNow() {
+  try {
+    await setDoc(doc(db,'events', CURRENT_DOC_ID), { ...window.state, _updatedAt: Date.now() });
+  } catch(e) {}
+}
+
+// グローバルに公開
+window.openViewEvent  = openViewEvent;
+window.closeViewEvent = closeViewEvent;
+window.loadViewEvent  = loadViewEvent;
+window.deleteViewEvent= deleteViewEvent;
+window.saveAsEvent    = saveAsEvent;
+window.renderEventList= renderEventList;
+window.scheduleSave   = scheduleSave;
+window.saveNow        = saveNow;
+
+// ── INIT ──────────────────────────────────────────────────────────────────────
+window.addEventListener('load', async () => {
+  // ローカルストレージから復元
+  try {
+    const raw = localStorage.getItem('regattaScorer3');
+    if (raw) { const s=JSON.parse(raw); migrateState(s); window.state=s; }
+  } catch(e) {}
+
+  // Firebaseから最新を取得
+  try {
+    const snap = await getDoc(doc(db,'events',CURRENT_DOC_ID));
+    if (snap.exists()) {
+      const remote = snap.data();
+      const remoteTime = remote._updatedAt||0;
+      const localTime  = window.state._updatedAt||0;
+      if (remoteTime >= localTime) {
+        migrateState(remote);
+        window.state = remote;
+        delete window.state._updatedAt;
+      }
+    }
+    setSyncStatus('ok','syncConnected');
+    startRealtimeSync();
+  } catch(e) {
+    setSyncStatus('err','syncOffline');
+  }
+
+  localStorage.setItem('regattaScorer3', JSON.stringify(window.state));
+  applyStateToUI();
+});
+
+</script>
+<style>
+:root{--navy:#0a1628;--deep:#0d1f3c;--ocean:#0e3460;--foam:#2e86ab;--sky:#a8dadc;--salt:#f1faee;--gold:#e9c46a;--red:#e63946;--green:#52b788;--muted:#4a6484;--border:rgba(46,134,171,0.25);--panel-bg:linear-gradient(135deg,rgba(13,31,60,0.95) 0%,rgba(10,22,40,0.95) 100%);--input-bg:rgba(255,255,255,0.05);--input-focus:rgba(46,134,171,0.1);--ranked-bg:rgba(255,255,255,0.03);--ranked-border:rgba(255,255,255,0.06);--boat-btn-bg:rgba(46,134,171,0.12);--tab-bg:rgba(0,0,0,0.3);--sync-bar-bg:rgba(255,255,255,0.03);}
+body.light{--navy:#f0f4f8;--deep:#ffffff;--ocean:#ddeeff;--foam:#1a6fa0;--sky:#1a6fa0;--salt:#1a2a3a;--gold:#c4900a;--red:#c0222e;--green:#2a7a50;--muted:#6688aa;--border:rgba(26,111,160,0.25);--panel-bg:linear-gradient(135deg,rgba(255,255,255,0.98) 0%,rgba(235,245,255,0.98) 100%);--input-bg:rgba(0,0,0,0.04);--input-focus:rgba(26,111,160,0.08);--ranked-bg:rgba(0,0,0,0.02);--ranked-border:rgba(0,0,0,0.08);--boat-btn-bg:rgba(26,111,160,0.08);--tab-bg:rgba(0,0,0,0.06);--sync-bar-bg:rgba(0,0,0,0.03);}
+*{box-sizing:border-box;margin:0;padding:0;}
+html,body{overflow-x:hidden;max-width:100vw;}
+body{background:var(--navy);color:var(--salt);font-family:'DM Sans',sans-serif;min-height:100vh;transition:background 0.25s,color 0.25s;}
+body::before{content:'';position:fixed;bottom:0;left:0;right:0;height:300px;background:linear-gradient(180deg,transparent 0%,rgba(14,52,96,0.4) 100%);pointer-events:none;z-index:0;}
+body.light::before{background:linear-gradient(180deg,transparent 0%,rgba(200,220,240,0.3) 100%);}
+header{background:linear-gradient(135deg,var(--deep) 0%,var(--ocean) 100%);border-bottom:2px solid var(--foam);padding:0 1rem;position:sticky;top:0;z-index:100;box-shadow:0 4px 30px rgba(0,0,0,0.5);}
+body.light header{box-shadow:0 4px 20px rgba(0,0,0,0.12);}
+.header-inner{max-width:1400px;margin:0 auto;display:flex;align-items:center;justify-content:space-between;height:60px;gap:0.5rem;}
+.logo{display:flex;align-items:center;flex-shrink:0;}
+.logo-anim-wrap{position:relative;display:inline-flex;align-items:center;height:60px;overflow:hidden;}
+.logo-label{font-family:'Bebas Neue',sans-serif;font-size:1.6rem;letter-spacing:0.12em;color:var(--sky);white-space:nowrap;line-height:1;}
+.sail-mover{position:absolute;top:8px;animation:sailMove 6s linear infinite;pointer-events:none;z-index:10;}
+.sail-boat{display:inline-block;font-size:1.1rem;animation:boatBob 1.9s ease-in-out infinite;}
+.wc{display:inline-block;animation:waveChar 1.5s ease-in-out infinite;color:var(--sky);}
+.wc.sc{color:var(--gold);}
+.wsp{display:inline-block;width:0.35em;}
+@keyframes sailMove{0%{left:-1.8em;}100%{left:108%;}}
+@keyframes boatBob{0%,100%{transform:translateY(0);}50%{transform:translateY(-5px);}}
+@keyframes waveChar{0%,100%{transform:translateY(0);}50%{transform:translateY(-4px);}}
+.header-actions{display:flex;gap:0.35rem;align-items:center;flex-shrink:0;}
+@media(max-width:420px){.logo{font-size:1.1rem;}.btn{font-size:0.7rem;padding:0.38rem 0.55rem;}}
+.main{max-width:1400px;margin:0 auto;padding:1.1rem;position:relative;z-index:1;}
+.panel{background:var(--panel-bg);border:1px solid var(--border);border-radius:12px;padding:1.1rem;margin-bottom:1.1rem;backdrop-filter:blur(10px);}
+.panel-title{font-family:'Bebas Neue',sans-serif;font-size:1rem;letter-spacing:0.12em;color:var(--sky);margin-bottom:0.9rem;display:flex;align-items:center;gap:0.5rem;flex-wrap:wrap;}
+.panel-title::before{content:'';display:block;width:3px;height:1em;background:var(--foam);border-radius:2px;flex-shrink:0;}
+.setup-grid{display:grid;grid-template-columns:1fr 1fr;gap:0.85rem;}
+@media(max-width:520px){.setup-grid{grid-template-columns:1fr;}}
+label{display:block;font-size:0.7rem;font-weight:500;color:var(--sky);letter-spacing:0.08em;text-transform:uppercase;margin-bottom:0.3rem;}
+input[type=text],input[type=number],select{width:100%;background:var(--input-bg);border:1px solid var(--border);border-radius:6px;padding:0.5rem 0.75rem;color:var(--salt);font-family:'DM Mono',monospace;font-size:0.86rem;transition:border-color 0.2s,background 0.2s;outline:none;}
+input:focus,select:focus{border-color:var(--foam);background:var(--input-focus);}
+select option{background:var(--deep);}
+.boats-list{display:flex;flex-wrap:wrap;gap:0.45rem;margin-top:0.55rem;}
+.boat-tag{background:rgba(46,134,171,0.15);border:1px solid var(--border);border-radius:20px;padding:0.22rem 0.7rem 0.22rem 0.85rem;font-size:0.8rem;color:var(--sky);display:flex;align-items:center;gap:0.35rem;font-family:'DM Mono',monospace;}
+.boat-tag .edit-name{background:transparent;border:none;border-bottom:1px dashed rgba(168,218,220,0.4);color:var(--sky);font-family:'DM Mono',monospace;font-size:0.8rem;width:auto;min-width:40px;max-width:130px;outline:none;padding:0;}
+.boat-tag .edit-name:focus{border-bottom-color:var(--foam);}
+.boat-tag button{background:none;border:none;color:var(--muted);cursor:pointer;font-size:0.9rem;line-height:1;padding:0;transition:color 0.15s;}
+.boat-tag button:hover{color:var(--red);}
+.add-row{display:flex;gap:0.45rem;margin-bottom:0.4rem;}
+.add-row input{flex:1;}
+.btn{font-family:'DM Sans',sans-serif;font-weight:500;font-size:0.8rem;padding:0.48rem 1rem;border-radius:6px;border:none;cursor:pointer;transition:all 0.15s;letter-spacing:0.02em;white-space:nowrap;}
+.btn-primary{background:var(--foam);color:var(--navy);}
+.btn-primary:hover{background:var(--sky);transform:translateY(-1px);}
+.btn-secondary{background:rgba(46,134,171,0.15);color:var(--sky);border:1px solid var(--border);}
+.btn-secondary:hover{background:rgba(46,134,171,0.3);}
+.btn-danger{background:rgba(230,57,70,0.15);color:#ff6b7a;border:1px solid rgba(230,57,70,0.3);}
+.btn-danger:hover{background:rgba(230,57,70,0.3);}
+.btn-gold{background:var(--gold);color:var(--navy);font-weight:600;}
+.btn-gold:hover{background:#f4d483;transform:translateY(-1px);}
+.btn-cloud{background:rgba(66,133,244,0.2);color:#7ab4ff;border:1px solid rgba(66,133,244,0.3);}
+.btn-cloud:hover{background:rgba(66,133,244,0.35);}
+.btn-theme{background:rgba(255,255,255,0.1);color:var(--sky);border:1px solid var(--border);font-size:1rem;padding:0.32rem 0.6rem;}
+.btn-theme:hover{background:rgba(255,255,255,0.2);}
+body.light .btn-theme{background:rgba(0,0,0,0.07);}
+.btn:disabled{opacity:0.4;cursor:not-allowed;transform:none!important;}
+/* sync bar */
+.sync-bar{display:flex;align-items:center;gap:0.5rem;font-size:0.72rem;color:var(--muted);padding:0.4rem 0.75rem;background:var(--sync-bar-bg);border-bottom:1px solid var(--border);}
+.sync-dot{width:7px;height:7px;border-radius:50%;background:var(--muted);flex-shrink:0;transition:background 0.3s;}
+.sync-dot.ok{background:var(--green);}
+.sync-dot.saving{background:var(--gold);animation:pulse 1s infinite;}
+.sync-dot.err{background:var(--red);}
+@keyframes pulse{0%,100%{opacity:1;}50%{opacity:0.3;}}
+.tabs{display:flex;gap:0.2rem;background:var(--tab-bg);padding:0.22rem;border-radius:8px;margin-bottom:1.1rem;}
+.tab{flex:1;padding:0.5rem 0.4rem;border:none;border-radius:6px;background:none;color:var(--muted);cursor:pointer;font-family:'DM Sans',sans-serif;font-size:0.8rem;font-weight:500;transition:all 0.15s;text-align:center;}
+.tab.active{background:var(--ocean);color:var(--sky);box-shadow:0 2px 8px rgba(0,0,0,0.3);}
+.tab-content{display:none;}
+.tab-content.active{display:block;}
+/* ENTRY */
+.race-header{display:flex;align-items:center;justify-content:space-between;margin-bottom:1rem;flex-wrap:wrap;gap:0.5rem;}
+.race-num{font-family:'Bebas Neue',sans-serif;font-size:1.4rem;color:var(--gold);letter-spacing:0.1em;}
+.finish-layout{display:grid;grid-template-columns:1fr 1fr;gap:0.9rem;align-items:start;}
+@media(max-width:560px){.finish-layout{grid-template-columns:1fr;}}
+.finish-section-label{font-size:0.68rem;font-weight:500;color:var(--muted);text-transform:uppercase;letter-spacing:0.1em;margin-bottom:0.45rem;}
+.unranked-pool{display:flex;flex-direction:column;gap:0.35rem;min-height:50px;}
+.boat-btn{display:flex;align-items:center;gap:0.65rem;background:var(--boat-btn-bg);border:1.5px solid var(--border);border-radius:8px;padding:0.65rem 0.9rem;color:var(--salt);font-family:'DM Mono',monospace;font-size:0.88rem;cursor:pointer;transition:all 0.15s;text-align:left;width:100%;position:relative;overflow:hidden;}
+.boat-btn::before{content:'';position:absolute;inset:0;background:linear-gradient(90deg,rgba(46,134,171,0.2) 0%,transparent 100%);opacity:0;transition:opacity 0.15s;}
+.boat-btn:hover{border-color:var(--foam);transform:translateX(3px);}
+.boat-btn:hover::before{opacity:1;}
+.boat-btn:active{transform:scale(0.98);}
+.boat-btn .boat-dot{width:7px;height:7px;border-radius:50%;background:var(--foam);flex-shrink:0;}
+.tap-hint{font-size:0.68rem;color:var(--muted);margin-left:auto;flex-shrink:0;}
+.penalty-select{background:rgba(255,255,255,0.07);border:1px solid rgba(255,255,255,0.1);border-radius:4px;color:var(--muted);font-size:0.7rem;padding:0.18rem 0.28rem;cursor:pointer;font-family:'DM Mono',monospace;width:auto;flex-shrink:0;}
+.penalty-select:focus{outline:none;border-color:var(--foam);}
+.ranked-list{display:flex;flex-direction:column;gap:0.3rem;min-height:50px;}
+.ranked-item{display:flex;align-items:center;gap:0.55rem;background:var(--ranked-bg);border:1px solid var(--ranked-border);border-radius:8px;padding:0.55rem 0.8rem;animation:slideIn 0.16s ease;}
+@keyframes slideIn{from{opacity:0;transform:translateY(-5px);}to{opacity:1;transform:translateY(0);}}
+.rank-num{font-family:'Bebas Neue',sans-serif;font-size:1.05rem;min-width:22px;text-align:center;}
+.rank-1-c{color:var(--gold);}.rank-2-c{color:var(--sky);}.rank-3-c{color:var(--green);}.rank-n-c{color:var(--muted);}
+.ranked-boat-name{font-family:'DM Mono',monospace;font-size:0.86rem;flex:1;}
+.undo-btn{background:none;border:none;color:var(--muted);cursor:pointer;font-size:0.82rem;padding:0.12rem 0.22rem;border-radius:4px;transition:all 0.15s;line-height:1;flex-shrink:0;}
+.undo-btn:hover{color:var(--red);background:rgba(230,57,70,0.1);}
+.progress-bar-wrap{height:3px;background:rgba(255,255,255,0.07);border-radius:2px;margin-bottom:0.7rem;overflow:hidden;}
+.progress-bar{height:100%;background:linear-gradient(90deg,var(--foam),var(--sky));border-radius:2px;transition:width 0.3s ease;}
+.code-legend{display:grid;grid-template-columns:repeat(auto-fill,minmax(170px,1fr));gap:0.18rem 1rem;font-size:0.75rem;color:var(--muted);line-height:1.7;}
+.code-legend b{color:var(--sky);}
+/* RESULTS */
+.results-wrap{overflow-x:auto;}
+table{width:100%;border-collapse:collapse;font-size:0.82rem;min-width:420px;}
+th{font-family:'DM Mono',monospace;font-size:0.66rem;font-weight:500;color:var(--muted);text-transform:uppercase;letter-spacing:0.08em;padding:0.5rem 0.65rem;text-align:center;border-bottom:1px solid var(--border);white-space:nowrap;}
+th.left{text-align:left;}
+td{padding:0.46rem 0.65rem;text-align:center;border-bottom:1px solid rgba(46,134,171,0.08);font-family:'DM Mono',monospace;vertical-align:middle;}
+td.left{text-align:left;font-family:'DM Sans',sans-serif;white-space:nowrap;}
+tr:hover td{background:rgba(46,134,171,0.04);}
+tr.winner td{background:rgba(233,196,106,0.06);}
+tr.winner td.left{color:var(--gold);font-weight:500;}
+.rank-badge{display:inline-flex;align-items:center;justify-content:center;width:24px;height:24px;border-radius:50%;font-family:'Bebas Neue',sans-serif;font-size:0.9rem;}
+.rank-1{background:var(--gold);color:var(--navy);}
+.rank-2{background:var(--sky);color:var(--navy);}
+.rank-3{background:var(--green);color:var(--navy);}
+.rank-n{background:rgba(255,255,255,0.1);color:var(--muted);}
+.score-cell{font-weight:500;font-size:0.9rem;}
+.score-cell.total{font-size:1rem;color:var(--gold);}
+.throwout{position:relative;color:var(--muted);}
+.throwout::after{content:'';position:absolute;left:50%;top:50%;transform:translate(-50%,-50%);width:80%;height:1px;background:var(--muted);}
+.status-badge{font-size:0.66rem;padding:0.1rem 0.32rem;border-radius:3px;letter-spacing:0.04em;}
+.s-dns,.s-dnf{background:rgba(230,57,70,0.2);color:#ff8f9a;}
+.s-dnc{background:rgba(100,100,100,0.3);color:#aaa;}
+.s-ocs{background:rgba(233,196,106,0.2);color:var(--gold);}
+.s-dsq,.s-bfd,.s-ufd{background:rgba(230,57,70,0.35);color:#ff6b7a;}
+.s-ret{background:rgba(150,100,50,0.3);color:#c8956a;}
+.s-dne{background:rgba(180,0,180,0.25);color:#e89eff;}
+.s-zfp{background:rgba(130,80,200,0.2);color:#c4a0ff;}
+/* MODALS */
+.modal-overlay{display:none;position:fixed;inset:0;background:rgba(0,0,0,0.72);z-index:200;backdrop-filter:blur(4px);overflow-y:auto;padding:1.5rem 1rem;align-items:flex-start;justify-content:center;}
+.modal-overlay.open{display:flex;}
+.modal{background:var(--deep);border:1px solid var(--border);border-radius:12px;padding:1.4rem;width:100%;max-width:540px;box-shadow:0 20px 60px rgba(0,0,0,0.6);}
+.modal-title{font-family:'Bebas Neue',sans-serif;font-size:1.25rem;letter-spacing:0.1em;color:var(--gold);margin-bottom:1rem;}
+.modal-actions{display:flex;gap:0.45rem;justify-content:flex-end;margin-top:1rem;flex-wrap:wrap;}
+/* Cloud modal */
+.cloud-tabs{display:flex;gap:0.2rem;background:rgba(0,0,0,0.25);padding:0.2rem;border-radius:7px;margin-bottom:0.9rem;}
+.cloud-tab{flex:1;padding:0.45rem;border:none;border-radius:5px;background:none;color:var(--muted);cursor:pointer;font-family:'DM Sans',sans-serif;font-size:0.78rem;font-weight:500;transition:all 0.15s;text-align:center;}
+.cloud-tab.active{background:rgba(66,133,244,0.25);color:#7ab4ff;}
+.cloud-tab-content{display:none;}
+.cloud-tab-content.active{display:block;}
+.drive-list{display:flex;flex-direction:column;gap:0.45rem;max-height:340px;overflow-y:auto;}
+.drive-item{display:flex;align-items:center;gap:0.7rem;background:rgba(255,255,255,0.03);border:1px solid var(--border);border-radius:8px;padding:0.7rem 0.9rem;cursor:pointer;transition:all 0.15s;}
+.drive-item:hover{background:rgba(46,134,171,0.1);border-color:var(--foam);}
+.drive-item-name{font-family:'DM Mono',monospace;font-size:0.82rem;font-weight:500;color:var(--salt);}
+.drive-item-date{font-size:0.7rem;color:var(--muted);white-space:nowrap;flex-shrink:0;}
+.drive-status{font-size:0.8rem;color:var(--muted);text-align:center;padding:1.5rem;font-style:italic;}
+.drive-spinner{display:inline-block;width:14px;height:14px;border:2px solid rgba(168,218,220,0.2);border-top-color:var(--sky);border-radius:50%;animation:spin 0.7s linear infinite;vertical-align:middle;margin-right:0.3rem;}
+@keyframes spin{to{transform:rotate(360deg);}}
+/* race/edit rows */
+.race-card{background:rgba(255,255,255,0.03);border:1px solid var(--border);border-radius:8px;padding:0.8rem 1rem;display:flex;align-items:center;justify-content:space-between;gap:0.7rem;flex-wrap:wrap;margin-bottom:0.5rem;}
+.race-card-info{display:flex;align-items:center;gap:0.7rem;flex-wrap:wrap;}
+.race-pill{font-family:'Bebas Neue',sans-serif;font-size:0.85rem;letter-spacing:0.1em;background:var(--ocean);padding:0.15rem 0.55rem;border-radius:4px;color:var(--sky);}
+.race-summary{font-size:0.76rem;color:var(--muted);font-family:'DM Mono',monospace;}
+.race-comment{font-size:0.74rem;color:var(--sky);opacity:0.8;font-family:'DM Mono',monospace;}
+.wind-select{background:var(--input-bg);border:1px solid var(--border);border-radius:5px;padding:0.28rem 0.4rem;color:var(--salt);font-family:'DM Mono',monospace;font-size:0.78rem;outline:none;}
+.edit-row{display:flex;align-items:center;gap:0.45rem;padding:0.32rem 0;border-bottom:1px solid rgba(255,255,255,0.05);flex-wrap:nowrap;}
+.edit-row:last-child{border-bottom:none;}
+.edit-boat-name{flex:1;font-family:'DM Mono',monospace;font-size:0.85rem;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;min-width:60px;}
+.edit-rank-input{width:52px;flex-shrink:0;text-align:center;font-size:0.88rem;padding:0.32rem 0.28rem;}
+.edit-status-select{font-size:0.76rem;padding:0.32rem 0.28rem;flex-shrink:0;width:80px;}
+/* handicap */
+.boat-throwout-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(120px,1fr));gap:0.35rem;margin-top:0.4rem;}
+.boat-throwout-item{display:flex;align-items:center;gap:0.4rem;background:rgba(255,255,255,0.03);border:1px solid var(--border);border-radius:6px;padding:0.3rem 0.55rem;}
+.bt-name{font-family:'DM Mono',monospace;color:var(--sky);font-size:0.78rem;flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;}
+.bt-input{width:36px!important;flex-shrink:0;text-align:center;padding:0.2rem 0.25rem;font-size:0.8rem;}
+.bt-input::-webkit-inner-spin-button,.bt-input::-webkit-outer-spin-button{-webkit-appearance:none;}
+.bt-input{-moz-appearance:textfield;}
+.handicap-note{font-size:0.72rem;color:var(--muted);margin-bottom:0.4rem;font-family:'DM Sans',sans-serif;}
+.throwout-info{font-size:0.74rem;color:var(--muted);background:rgba(255,255,255,0.03);border-radius:5px;padding:0.45rem 0.75rem;margin-top:0.38rem;font-family:'DM Mono',monospace;line-height:1.6;}
+.highlight{color:var(--sky);}
+.empty{text-align:center;padding:2.2rem 1rem;color:var(--muted);font-size:0.86rem;}
+.empty-icon{font-size:2rem;margin-bottom:0.55rem;opacity:0.4;}
+.tiebreak-note{font-size:0.68rem;color:var(--muted);font-style:italic;margin-top:0.28rem;}
+.toast{position:fixed;bottom:1.5rem;left:50%;transform:translateX(-50%) translateY(100px);background:var(--deep);border:1px solid var(--foam);border-radius:8px;padding:0.6rem 1.3rem;color:var(--sky);font-size:0.8rem;transition:transform 0.3s ease;z-index:999;white-space:nowrap;box-shadow:0 4px 20px rgba(0,0,0,0.4);}
+.toast.show{transform:translateX(-50%) translateY(0);}
+#pngCapture{position:fixed;left:-9999px;top:0;background:#0a1628;padding:24px;min-width:600px;z-index:-1;}
+</style>
+</head>
+<body>
+
+<header>
+  <div class="header-inner">
+    <div class="logo">
+      <div class="logo-anim-wrap">
+        <span class="sail-mover" aria-hidden="true"><span class="sail-boat"><svg viewBox="0 0 30 26" width="28" height="24" fill="none" xmlns="http://www.w3.org/2000/svg"><path d="M23 4 L13 0 L8 17 L23 18 Z" fill="#a8dadc" stroke="#a8dadc" stroke-width="0.7"/><line x1="23" y1="3" x2="23" y2="19" stroke="#a8dadc" stroke-width="1.5"/><path d="M3 20 L6 23 L26 23 L27 19 L23 19 Z" fill="#a8dadc" opacity="0.85"/><path d="M6 22 L5 26 L3 26 L4 22 Z" fill="#a8dadc" opacity="0.7"/></svg></span></span>
+        <span class="sail-mover" style="animation-duration:4.5s;animation-delay:-1.5s;top:14px;" aria-hidden="true"><span class="sail-boat" style="animation-duration:1.5s;"><svg viewBox="0 0 30 26" width="28" height="24" fill="none" xmlns="http://www.w3.org/2000/svg"><path d="M23 4 L13 0 L8 17 L23 18 Z" fill="#a8dadc" stroke="#a8dadc" stroke-width="0.7"/><line x1="23" y1="3" x2="23" y2="19" stroke="#a8dadc" stroke-width="1.5"/><path d="M3 20 L6 23 L26 23 L27 19 L23 19 Z" fill="#a8dadc" opacity="0.85"/><path d="M6 22 L5 26 L3 26 L4 22 Z" fill="#a8dadc" opacity="0.7"/></svg></span></span>
+        <span class="logo-label"><span class="wc" style="animation-delay:0s">R</span><span class="wc" style="animation-delay:.12s">E</span><span class="wc" style="animation-delay:.24s">G</span><span class="wc" style="animation-delay:.36s">A</span><span class="wc" style="animation-delay:.48s">T</span><span class="wc" style="animation-delay:.60s">T</span><span class="wc" style="animation-delay:.72s">A</span><span class="wsp"> </span><span class="wc sc" style="animation-delay:.96s">S</span><span class="wc sc" style="animation-delay:1.08s">C</span><span class="wc sc" style="animation-delay:1.20s">O</span><span class="wc sc" style="animation-delay:1.32s">R</span><span class="wc sc" style="animation-delay:1.44s">E</span><span class="wc sc" style="animation-delay:1.56s">R</span></span>
+      </div>
+    </div>
+    <div class="header-actions">
+      <button class="btn btn-theme" id="themeToggleBtn" onclick="toggleTheme()" title="テーマ切り替え">☀</button>
+      <button class="btn btn-cloud" onclick="openCloudModal()" data-i18n="headerCloud">☁ 大会</button>
+      <button class="btn btn-danger" onclick="resetAll()" data-i18n="headerReset">リセット</button>
+    </div>
+  </div>
+</header>
+
+<!-- sync bar -->
+<div class="sync-bar">
+  <div class="sync-dot" id="syncDot"></div>
+  <span id="syncLabel">接続中...</span>
+</div>
+
+<div class="main">
+  <div class="tabs">
+    <button class="tab active" onclick="switchTab('setup')" data-i18n="tabSetup">⚙ 設定</button>
+    <button class="tab" onclick="switchTab('entry')" data-i18n="tabEntry">✚ 入力</button>
+    <button class="tab" onclick="switchTab('results')" data-i18n="tabResults">🏆 成績表</button>
+  </div>
+
+  <!-- SETUP -->
+  <div class="tab-content active" id="tab-setup">
+    <div class="panel">
+      <div class="panel-title" data-i18n="setupTitle">シリーズ設定</div>
+      <div class="setup-grid">
+        <div><label data-i18n="labelName">大会名</label><input type="text" id="seriesName" placeholder="2025 Summer Series" data-i18n-placeholder="namePlaceholder" oninput="saveState()"></div>
+        <div>
+          <label data-i18n="labelThrowouts">捨てレース数（Throwout）</label>
+          <input type="number" id="throwouts" min="0" max="10" value="1" oninput="updateThrowoutInfo();saveState()">
+          <div class="throwout-info" id="throwoutInfo"></div>
+        </div>
+        <div style="grid-column:1/-1;display:flex;gap:0.85rem;">
+          <div style="flex:1;min-width:0;"><label data-i18n="labelDateFrom">開始日</label><input type="text" id="dateFrom" placeholder="2025/06/01" readonly></div>
+          <div style="flex:1;min-width:0;"><label data-i18n="labelDateTo">終了日</label><input type="text" id="dateTo" placeholder="2025/06/03" readonly></div>
+        </div>
+      </div>
+    </div>
+    <div class="panel">
+      <div class="panel-title" data-i18n="boatsTitle">参加艇登録</div>
+      <div class="add-row">
+        <input type="text" id="boatInput" placeholder="艇名を入力" data-i18n-placeholder="boatPlaceholder" onkeydown="if(event.key==='Enter')addBoat()">
+        <button class="btn btn-primary" onclick="addBoat()" data-i18n="boatAdd">追加</button>
+      </div>
+      <div class="boats-list" id="boatsList"></div>
+    </div>
+    <div class="panel" id="handicapPanel" style="display:none;">
+      <div class="panel-title" data-i18n="handicapTitle">個別捨てレース設定</div>
+      <p class="handicap-note" data-i18n="handicapNote">空欄の場合は「捨てレース数」に設定した数を適用します。</p>
+      <div class="boat-throwout-grid" id="boatThrowoutList"></div>
+    </div>
+  </div>
+
+  <!-- ENTRY -->
+  <div class="tab-content" id="tab-entry">
+    <div class="panel">
+      <div class="race-header">
+        <div style="display:flex;align-items:center;gap:0.8rem;flex-wrap:wrap;">
+          <span class="race-num" id="raceNumLabel">RACE #1</span>
+          <div id="entryWindSelects"></div>
+        </div>
+        <div style="display:flex;gap:0.4rem;flex-wrap:wrap;">
+          <button class="btn btn-gold" onclick="saveRace()" id="saveBtn" data-i18n="entrySaveBtn">保存</button>
+          <button class="btn btn-secondary" onclick="openRaceListModal()" data-i18n="entryEditBtn">RACE着順編集</button>
+        </div>
+      </div>
+      <div class="progress-bar-wrap"><div class="progress-bar" id="progressBar" style="width:0%"></div></div>
+      <div id="entryArea">
+        <div class="finish-layout">
+          <div>
+            <div class="finish-section-label" data-i18n="tapLabel">タップして順位をつける ↓</div>
+            <div class="unranked-pool" id="unrankedPool"></div>
+          </div>
+          <div>
+            <div class="finish-section-label" data-i18n="finishLabel">フィニッシュ順</div>
+            <div class="ranked-list" id="rankedList"></div>
+          </div>
+        </div>
+      </div>
+      <div class="empty" id="entryEmpty" style="display:none;"><div class="empty-icon">⚓</div><span data-i18n="noBoatsEntry">設定タブで艇を登録してください</span></div>
+    </div>
+    <div class="panel">
+      <div class="panel-title" data-i18n="statusTitle">ステータスコード</div>
+      <div class="code-legend">
+        <span><b>DNS</b> <span data-i18n="sDns">スタートせず</span></span><span><b>DNC</b> <span data-i18n="sDnc">出場せず</span></span>
+        <span><b>OCS</b> <span data-i18n="sOcs">フライング</span></span><span><b>DNF</b> <span data-i18n="sDnf">フィニッシュせず</span></span>
+        <span><b>RET</b> <span data-i18n="sRet">リタイア</span></span><span><b>DSQ</b> <span data-i18n="sDsq">失格</span></span>
+        <span><b>BFD</b> <span data-i18n="sBfd">黒旗失格</span></span><span><b>UFD</b> <span data-i18n="sUfd">U旗失格</span></span>
+        <span><b>DNE</b> <span data-i18n="sDne">除外不可失格</span></span><span><b>ZFP</b> <span data-i18n="sZfp">Z旗ペナルティ（20%）</span></span>
+      </div>
+      <p style="font-size:0.72rem;color:var(--muted);margin-top:0.55rem;" data-i18n-html="statusNote">DNS〜DNE → 出走艇数＋1点。<b style="color:#e89eff">DNEは捨てレース不可（RRS 90.3b）</b>。ZFP → 20%加算。</p>
+    </div>
+  </div>
+
+  <!-- RESULTS -->
+  <div class="tab-content" id="tab-results">
+    <div class="panel">
+      <div style="display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:0.5rem;margin-bottom:0.9rem;">
+        <div class="panel-title" id="resultsPanelTitle" style="margin-bottom:0;" data-i18n="resultsTitle">シリーズ成績表</div>
+        <div style="display:flex;gap:0.4rem;">
+          <button class="btn btn-secondary" onclick="exportPNG()" data-i18n="resultsPng">PNG 保存</button>
+          <button class="btn btn-secondary" onclick="copyPNG()" data-i18n="resultsShare">📤 シェア</button>
+        </div>
+      </div>
+      <div class="results-wrap"><div id="resultsTable"></div></div>
+      <div class="tiebreak-note" data-i18n="tiebreakNote">※ タイブレーク：A8.1 成績を良い順に比較（捨てレース除く）→ A8.2 最終レースから遡る</div>
+    </div>
+  </div>
+</div>
+
+<!-- Cloud modal -->
+<div class="modal-overlay" id="cloudModal" onclick="if(event.target===this)closeCloudModal()">
+  <div class="modal" style="max-width:500px;">
+    <div class="modal-title" data-i18n="cloudTitle">☁ 大会データ管理</div>
+    <div class="cloud-tabs">
+      <button class="cloud-tab active" onclick="switchCloudTab('save')" data-i18n="cloudSaveTab">今の大会を保存</button>
+      <button class="cloud-tab" onclick="switchCloudTab('list')" data-i18n="cloudListTab">過去の大会一覧</button>
+    </div>
+    <div class="cloud-tab-content active" id="ctab-save">
+      <p style="font-size:0.8rem;color:var(--muted);margin-bottom:0.4rem;" data-i18n="cloudAutoSave">入力中のデータはリアルタイムで自動保存されています。</p>
+      <p style="font-size:0.8rem;color:var(--muted);margin-bottom:0.9rem;" data-i18n="cloudSaveHint">大会が終わったら「大会として保存」で過去一覧に残せます。</p>
+      <button class="btn btn-cloud" id="saveEventBtn" onclick="saveAsEvent()" data-i18n="cloudSaveBtn">💾 大会として保存</button>
+    </div>
+    <div class="cloud-tab-content" id="ctab-list">
+      <div style="display:flex;justify-content:flex-end;margin-bottom:0.6rem;">
+        <button class="btn btn-secondary" onclick="renderEventList()" style="font-size:0.74rem;padding:0.32rem 0.7rem;" data-i18n="cloudRefresh">↺ 更新</button>
+      </div>
+      <div class="drive-list" id="eventList">
+        <div class="drive-status"><span class="drive-spinner"></span>読み込み中...</div>
+      </div>
+    </div>
+    <div class="modal-actions"><button class="btn btn-secondary" onclick="closeCloudModal()" data-i18n="cloudClose">閉じる</button></div>
+  </div>
+</div>
+
+<!-- View past event modal -->
+<div class="modal-overlay" id="viewEventModal" onclick="if(event.target===this)closeViewEvent()">
+  <div class="modal" style="max-width:680px;">
+    <div class="modal-title" id="viewEventTitle">大会成績</div>
+    <div class="results-wrap" id="viewEventResults"></div>
+    <div class="tiebreak-note" style="margin-top:0.3rem;" data-i18n="tiebreakShort">※ タイブレーク：A8.1→A8.2</div>
+    <div class="modal-actions">
+      <button class="btn btn-danger" onclick="deleteViewEvent()" style="margin-right:auto;" data-i18n="modalDelete">削除</button>
+      <button class="btn btn-secondary" onclick="loadViewEvent()" data-i18n="modalOpen">この大会を開く</button>
+      <button class="btn btn-secondary" onclick="closeViewEvent()" data-i18n="modalClose">閉じる</button>
+    </div>
+  </div>
+</div>
+
+<!-- Race list modal -->
+<div class="modal-overlay" id="raceListModal" onclick="if(event.target===this)closeRaceListModal()">
+  <div class="modal">
+    <div class="modal-title" data-i18n="raceListTitle">過去レースの編集</div>
+    <div id="raceListContent"></div>
+    <div class="modal-actions"><button class="btn btn-secondary" onclick="closeRaceListModal()" data-i18n="modalClose">閉じる</button></div>
+  </div>
+</div>
+
+<!-- Edit race modal -->
+<div class="modal-overlay" id="editRaceModal" onclick="if(event.target===this)closeEditRace()">
+  <div class="modal">
+    <div class="modal-title" id="editRaceTitle" data-i18n="raceEditTitle">RACE 編集</div>
+    <div style="font-size:0.74rem;color:var(--muted);margin-bottom:0.7rem;" data-i18n="raceEditHint">順位またはステータスを変更できます</div>
+    <div id="editWindSelectsWrap" style="margin-bottom:0.8rem;"></div>
+    <div id="editRaceForm"></div>
+    <div class="modal-actions">
+      <button class="btn btn-danger" onclick="deleteRace()" style="margin-right:auto;" data-i18n="modalDelete">削除</button>
+      <button class="btn btn-secondary" onclick="closeEditRace()" data-i18n="modalCancel">キャンセル</button>
+      <button class="btn btn-gold" onclick="saveEditRace()" data-i18n="modalSave">保存</button>
+    </div>
+  </div>
+</div>
+
+<div id="pngCapture"></div>
+<div class="toast" id="toast"></div>
+
+<script>
+// ── WIND DATA ─────────────────────────────────────────────────────────────────
+const WIND_DIRS = [
+  {deg:0,label:'北'},{deg:10,label:'北北東'},{deg:20,label:'北北東'},
+  {deg:30,label:'北東'},{deg:40,label:'北東'},{deg:50,label:'東北東'},
+  {deg:60,label:'東北東'},{deg:70,label:'東北東'},{deg:80,label:'東'},
+  {deg:90,label:'東'},{deg:100,label:'東南東'},{deg:110,label:'東南東'},
+  {deg:120,label:'南東'},{deg:130,label:'南東'},{deg:140,label:'南南東'},
+  {deg:150,label:'南南東'},{deg:160,label:'南'},{deg:170,label:'南'},
+  {deg:180,label:'南'},{deg:190,label:'南南西'},{deg:200,label:'南南西'},
+  {deg:210,label:'南西'},{deg:220,label:'南西'},{deg:230,label:'西南西'},
+  {deg:240,label:'西南西'},{deg:250,label:'西'},{deg:260,label:'西'},
+  {deg:270,label:'西'},{deg:280,label:'西北西'},{deg:290,label:'西北西'},
+  {deg:300,label:'北西'},{deg:310,label:'北西'},{deg:320,label:'北北西'},
+  {deg:330,label:'北北西'},{deg:340,label:'北'},{deg:350,label:'北北東'}
+];
+const WIND_SPEEDS = ['無風',1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20];
+function windSpeedOpts(cur){
+  return WIND_SPEEDS.map(v=>`<option value="${v}" ${String(cur)===String(v)?'selected':''}>${v==='無風'?'無風':v+' m/s'}</option>`).join('');
+}
+function windDirOpts(cur){
+  return '<option value="">—</option>'+WIND_DIRS.map(d=>`<option value="${d.deg}" ${String(cur)===String(d.deg)?'selected':''}>${d.deg}°（${d.label}）</option>`).join('');
+}
+function windSelectsHTML(speedId,dirId,speedVal,dirVal){
+  return `<div style="display:flex;align-items:center;gap:0.4rem;flex-wrap:wrap;">
+    <span style="font-size:0.75rem;color:var(--muted);white-space:nowrap;">💨 風速</span>
+    <select id="${speedId}" class="wind-select" style="width:90px;">${windSpeedOpts(speedVal??'')}</select>
+    <span style="font-size:0.75rem;color:var(--muted);white-space:nowrap;">風向</span>
+    <select id="${dirId}" class="wind-select" style="width:130px;">${windDirOpts(dirVal??'')}</select>
+  </div>`;
+}
+function windLabel(speed,dir){
+  if(!speed&&(dir===''||dir===undefined||dir===null)) return '';
+  const sp=speed!==undefined&&speed!==''?(speed==='無風'?'無風':speed+'m/s'):'';
+  const dr=dir!==undefined&&dir!==''?(()=>{const d=WIND_DIRS.find(x=>String(x.deg)===String(dir));return d?`${dir}°（${d.label}）`:''})():'';
+  return [sp,dr].filter(Boolean).join(' / ');
+}
+
+// ── GLOBALS (Firebase functions assigned from module) ─────────────────────
+// scheduleSave, saveAsEvent, renderEventList, openViewEvent,
+// closeViewEvent, loadViewEvent, deleteViewEvent are set by the module above
+
+// ── I18N ──────────────────────────────────────────────────────────────────
+const LANG = new URLSearchParams(location.search).get('lang')==='en'?'en':'ja';
+const TX = {
+  ja:{
+    tabSetup:'⚙ 設定',tabEntry:'✚ 入力',tabResults:'🏆 成績表',
+    headerCloud:'☁ 大会',headerReset:'リセット',
+    setupTitle:'シリーズ設定',labelName:'大会名',namePlaceholder:'2025 Summer Series',
+    labelThrowouts:'捨てレース数（Throwout）',labelDateFrom:'開始日',labelDateTo:'終了日',
+    boatsTitle:'参加艇登録',boatPlaceholder:'艇名を入力',boatAdd:'追加',boatEmpty:'まだ登録されていません',
+    handicapTitle:'個別捨てレース設定',handicapNote:'空欄の場合は「捨てレース数」に設定した数を適用します。',
+    entryEditBtn:'RACE着順編集',entrySaveBtn:'保存',
+    tapLabel:'タップして順位をつける ↓',finishLabel:'フィニッシュ順',tapHint:'TAP→',
+    allDone:'✓ 全艇入力済み',noFinish:'まだフィニッシュなし',noBoatsEntry:'設定タブで艇を登録してください',
+    statusTitle:'ステータスコード',
+    sDns:'スタートせず',sDnc:'出場せず',sOcs:'フライング',sDnf:'フィニッシュせず',
+    sRet:'リタイア',sDsq:'失格',sBfd:'黒旗失格',sUfd:'U旗失格',sDne:'除外不可失格',sZfp:'Z旗ペナルティ（20%）',
+    statusNote:'DNS〜DNE → 出走艇数＋1点。<b style="color:#e89eff">DNEは捨てレース不可（RRS 90.3b）</b>。ZFP → 20%加算。',
+    resultsTitle:'シリーズ成績表',resultsPng:'PNG 保存',resultsShare:'📤 シェア',
+    tiebreakNote:'※ タイブレーク：A8.1 成績を良い順に比較（捨てレース除く）→ A8.2 最終レースから遡る',
+    colBoat:'艇名',colTotal:'合計',resultsEmpty:'レースを入力すると成績が表示されます',
+    cloudTitle:'☁ 大会データ管理',cloudSaveTab:'今の大会を保存',cloudListTab:'過去の大会一覧',
+    cloudAutoSave:'入力中のデータはリアルタイムで自動保存されています。',
+    cloudSaveHint:'大会が終わったら「大会として保存」で過去一覧に残せます。',
+    cloudSaveBtn:'💾 大会として保存',cloudClose:'閉じる',cloudRefresh:'↺ 更新',
+    cloudLoading:'読み込み中...',cloudEmpty:'保存済みの大会がありません',
+    modalOpen:'この大会を開く',modalDelete:'削除',modalClose:'閉じる',
+    tiebreakShort:'※ タイブレーク：A8.1→A8.2',
+    raceListTitle:'過去レースの編集',raceEditTitle:'RACE 編集',
+    raceEditHint:'順位またはステータスを変更できます',
+    modalCancel:'キャンセル',modalSave:'保存',
+    throwoutNone:'捨てレースなし',throwoutSome:'最悪<span class="highlight">{t}</span>レースを除外',
+    syncSaving:'保存中...',syncOk:'自動保存: ',syncErr:'保存失敗: ',
+    syncOther:'他のユーザーが更新しました',syncConnected:'接続済み',syncOffline:'オフライン（ローカルデータを使用中）',syncError:'同期エラー',
+    toastNoName:'先に大会名を入力してください',toastSaved:'☁ 大会データを保存しました',
+    toastSaveFail:'保存失敗: ',toastDeleted:'削除しました',toastDeleteFail:'削除失敗',
+    toastLoaded:'大会データを読み込みました',toastLoadFail:'読み込み失敗',toastNotFound:'データが見つかりません',
+    toastPngGen:'PNG生成中...',toastPngSaved:'PNG保存しました',toastPngFail:'PNG生成失敗',
+    toastCopied:'クリップボードにコピーしました',toastShared:'共有しました',
+    toastNewTab:'新しいタブで開きました（長押しで保存）',toastShareFail:'共有に失敗しました',
+    toastNoData:'データがありません',toastNoBothBoats:'レース入力後は削除できません',
+    toastDupName:'同名の艇が既に登録されています',toastRemainingPre:'残り',toastRemainingPost:'艇を入力してください',
+    toastRaceSaved:'Race #{n} を保存しました',toastRaceUpdated:'Race {n} を更新しました',toastRaceDeleted:'レースを削除しました',
+    toastReset:'リセットしました',toastWrongPass:'パスワードが違います',
+    confirmReset:'参加艇以外をリセットしますか？\n（保存済みの過去大会は残ります）',
+    confirmLoad:'この大会データを開きますか？\n現在の入力内容は上書きされます。',
+    confirmDeleteEvent:'「{t}」を削除しますか？',confirmDeleteRace:'Race {n} を削除しますか？',
+    promptPass:'パスワードを入力してください',
+    racePill:'RACE',race1st:'1位: ',raceBoats:'艇',
+    boatsCount:'艇 / ',racesCount:'レース',noTitle:'無題',
+    exportTitle:'SERIES',
+  },
+  en:{
+    tabSetup:'⚙ Setup',tabEntry:'✚ Entry',tabResults:'🏆 Results',
+    headerCloud:'☁ Events',headerReset:'Reset',
+    setupTitle:'Series Settings',labelName:'Event Name',namePlaceholder:'2025 Summer Series',
+    labelThrowouts:'Throwouts',labelDateFrom:'Start Date',labelDateTo:'End Date',
+    boatsTitle:'Boat Registration',boatPlaceholder:'Enter boat name',boatAdd:'Add',boatEmpty:'No boats registered yet',
+    handicapTitle:'Individual Throwout Settings',handicapNote:'If blank, the global throwout setting applies.',
+    entryEditBtn:'Edit Race Results',entrySaveBtn:'Save',
+    tapLabel:'Tap to assign finishing order ↓',finishLabel:'Finish Order',tapHint:'TAP→',
+    allDone:'✓ All boats entered',noFinish:'No finishes yet',noBoatsEntry:'Register boats in the Setup tab',
+    statusTitle:'Status Codes',
+    sDns:'Did Not Start',sDnc:'Did Not Come',sOcs:'On Course Side (OCS)',sDnf:'Did Not Finish',
+    sRet:'Retired',sDsq:'Disqualified',sBfd:'Black Flag (BFD)',sUfd:'U Flag (UFD)',sDne:'Disqualification (non-excludable)',sZfp:'Z Flag Penalty (20%)',
+    statusNote:'DNS–DNE → entries + 1 pts. <b style="color:#e89eff">DNE is non-excludable (RRS 90.3b)</b>. ZFP → +20%.',
+    resultsTitle:'Series Results',resultsPng:'Save PNG',resultsShare:'📤 Share',
+    tiebreakNote:'* Tiebreak: A8.1 compare scores best-to-worst (excl. throwouts) → A8.2 last race backwards',
+    colBoat:'Boat',colTotal:'Total',resultsEmpty:'Enter races to see results',
+    cloudTitle:'☁ Event Management',cloudSaveTab:'Save Current Event',cloudListTab:'Past Events',
+    cloudAutoSave:'Data is saved automatically in real time.',
+    cloudSaveHint:'Use "Save as Event" to archive results when the event is complete.',
+    cloudSaveBtn:'💾 Save as Event',cloudClose:'Close',cloudRefresh:'↺ Refresh',
+    cloudLoading:'Loading...',cloudEmpty:'No saved events',
+    modalOpen:'Open This Event',modalDelete:'Delete',modalClose:'Close',
+    tiebreakShort:'* Tiebreak: A8.1→A8.2',
+    raceListTitle:'Edit Past Races',raceEditTitle:'Edit RACE',
+    raceEditHint:'Edit finishing position or status code',
+    modalCancel:'Cancel',modalSave:'Save',
+    throwoutNone:'No throwouts',throwoutSome:'Worst <span class="highlight">{t}</span> race(s) excluded',
+    syncSaving:'Saving...',syncOk:'Auto-saved: ',syncErr:'Save failed: ',
+    syncOther:'Updated by another user',syncConnected:'Connected',syncOffline:'Offline (using local data)',syncError:'Sync error',
+    toastNoName:'Please enter an event name first',toastSaved:'☁ Event saved',
+    toastSaveFail:'Save failed: ',toastDeleted:'Deleted',toastDeleteFail:'Delete failed',
+    toastLoaded:'Event data loaded',toastLoadFail:'Load failed',toastNotFound:'Data not found',
+    toastPngGen:'Generating PNG...',toastPngSaved:'PNG saved',toastPngFail:'PNG generation failed',
+    toastCopied:'Copied to clipboard',toastShared:'Shared successfully',
+    toastNewTab:'Opened in new tab (long press to save)',toastShareFail:'Share failed',
+    toastNoData:'No data',toastNoBothBoats:'Cannot delete after races have been entered',
+    toastDupName:'A boat with that name already exists',toastRemainingPre:'',toastRemainingPost:' boats remaining',
+    toastRaceSaved:'Race #{n} saved',toastRaceUpdated:'Race {n} updated',toastRaceDeleted:'Race deleted',
+    toastReset:'Reset complete',toastWrongPass:'Incorrect password',
+    confirmReset:'Reset everything except boat list?\n(Saved past events will remain)',
+    confirmLoad:'Load this event?\nCurrent data will be overwritten.',
+    confirmDeleteEvent:'Delete "{t}"?',confirmDeleteRace:'Delete Race {n}?',
+    promptPass:'Enter password',
+    racePill:'RACE',race1st:'1st: ',raceBoats:' boats',
+    boatsCount:' boats / ',racesCount:' races',noTitle:'Untitled',
+    exportTitle:'SERIES',
+  }
+};
+function t(key){ return TX[LANG][key] ?? TX.ja[key] ?? key; }
+function applyTranslations(){
+  document.querySelectorAll('[data-i18n]').forEach(el=>{el.textContent=t(el.dataset.i18n);});
+  document.querySelectorAll('[data-i18n-html]').forEach(el=>{el.innerHTML=t(el.dataset.i18nHtml);});
+  document.querySelectorAll('[data-i18n-placeholder]').forEach(el=>{el.placeholder=t(el.dataset.i18nPlaceholder);});
+  if(LANG==='en') document.documentElement.lang='en';
+}
+
+// ── STATE (non-Firebase) ───────────────────────────────────────────────────
+const PENALTY_STATUSES = ['DNS','DNC','OCS','DNF','RET','DSQ','BFD','UFD','DNE'];
+const NON_EXCLUDABLE   = ['DNE'];
+var state = { seriesName:'', totalRaces:7, throwouts:1, zfpPct:20, boats:[], races:[] };
+let editingRaceIndex = null;
+let currentRanked    = [];
+let currentUnranked  = [];
+
+function setSyncStatus(status, key, extra='') {
+  const dot=document.getElementById('syncDot');
+  const lbl=document.getElementById('syncLabel');
+  if(dot) dot.className='sync-dot '+status;
+  if(lbl) lbl.textContent=t(key)+extra;
+}
+
+// ── MIGRATE ────────────────────────────────────────────────────────────────
+function migrateState(s) {
+  if (!s.boats) s.boats=[];
+  if (!s.races) s.races=[];
+  if (!s.dateFrom) s.dateFrom='';
+  if (!s.dateTo) s.dateTo='';
+  if (s.boats.length && typeof s.boats[0]==='string')
+    s.boats=s.boats.map((n,i)=>({id:'b'+i,name:n,throwoutOverride:null}));
+  s.boats.forEach(b=>{ if(!('throwoutOverride' in b)) b.throwoutOverride=null; });
+  if (s.races.length && s.races[0].entries?.length && typeof s.races[0].entries[0].boat==='string')
+    s.races.forEach(r=>{r.entries=r.entries.map(e=>{const f=s.boats.find(b=>b.name===e.boat);return{boatId:f?f.id:e.boat,rank:e.rank,status:e.status};});});
+}
+
+// ── SAVE ──────────────────────────────────────────────────────────────────
+function saveState() {
+  state.seriesName=document.getElementById('seriesName').value;
+  state.throwouts =parseInt(document.getElementById('throwouts').value)||0;
+  state.zfpPct    =20;
+  state.dateFrom  =document.getElementById('dateFrom').value;
+  state.dateTo    =document.getElementById('dateTo').value;
+  localStorage.setItem('regattaScorer3', JSON.stringify(state));
+  renderResults(); updateResultsPanelTitle();
+  if (typeof scheduleSave==='function') scheduleSave();
+}
+
+// ── RESET ──────────────────────────────────────────────────────────────────
+function resetAll() {
+  if (!confirm(t('confirmReset'))) return;
+  const boats=state.boats.map(b=>({...b,throwoutOverride:null}));
+  state={seriesName:'',totalRaces:7,throwouts:1,zfpPct:20,boats,races:[],dateFrom:'',dateTo:''};
+  localStorage.setItem('regattaScorer3', JSON.stringify(state));
+  document.getElementById('seriesName').value='';
+  document.getElementById('throwouts').value=1;
+  if(fpFrom) fpFrom.clear();
+  if(fpTo) fpTo.clear();
+  updateThrowoutInfo();
+  resetEntrySession(); renderResults(); updateResultsPanelTitle();
+  if (typeof saveNow==='function') saveNow().then(()=>location.reload());
+  else location.reload();
+}
+
+
+// ── APPLY UI ───────────────────────────────────────────────────────────────
+function applyStateToUI() {
+  document.getElementById('seriesName').value =state.seriesName||'';
+  document.getElementById('throwouts').value  =state.throwouts??1;
+  if(fpFrom) state.dateFrom?fpFrom.setDate(state.dateFrom):fpFrom.clear();
+  if(fpTo)   state.dateTo  ?fpTo.setDate(state.dateTo)    :fpTo.clear();
+  updateThrowoutInfo();
+  renderBoatsList(); resetEntrySession(); renderResults(); updateResultsPanelTitle();
+}
+
+function updateResultsPanelTitle(){
+  const name=state.seriesName||(LANG==='en'?'Series':'シリーズ');
+  document.getElementById('resultsPanelTitle').textContent=name+'　'+(LANG==='en'?'Results':'成績表');
+}
+function updateThrowoutInfo(){
+  const n=parseInt(document.getElementById('throwouts').value)||0;
+  document.getElementById('throwoutInfo').innerHTML=n===0?t('throwoutNone')
+    :t('throwoutSome').replace('{t}',n);
+}
+
+// ── BOATS ──────────────────────────────────────────────────────────────────
+function genId(){return 'b'+Date.now()+Math.random().toString(36).slice(2,5);}
+
+function addBoat(){
+  const inp=document.getElementById('boatInput');
+  const name=inp.value.trim();
+  if (!name) return;
+  if (state.boats.some(b=>b.name===name)){showToast(t('toastDupName'));return;}
+  state.boats.push({id:genId(),name,throwoutOverride:null});
+  inp.value='';
+  saveState(); renderBoatsList(); resetEntrySession();
+}
+
+function removeBoat(id){
+  if (state.races.length>0){showToast(t('toastNoBothBoats'));return;}
+  state.boats=state.boats.filter(b=>b.id!==id);
+  saveState(); renderBoatsList(); resetEntrySession();
+}
+
+function renderBoatsList(){
+  const el=document.getElementById('boatsList');
+  if (!state.boats.length){
+    el.innerHTML=`<span style="color:var(--muted);font-size:0.8rem;">${t('boatEmpty')}</span>`;
+    document.getElementById('handicapPanel').style.display='none';
+    return;
+  }
+  el.innerHTML=state.boats.map(b=>`
+    <div class="boat-tag">
+      <span style="width:7px;height:7px;border-radius:50%;background:var(--foam);flex-shrink:0;display:inline-block;"></span>
+      <input class="edit-name" type="text" value="${escHtml(b.name)}" data-id="${b.id}" title="クリックして編集">
+      ${state.races.length===0?`<button onclick="removeBoat('${b.id}')" title="削除">×</button>`:''}
+    </div>`).join('');
+  renderBoatThrowoutList();
+}
+
+// event delegation: boat rename (on change = blur/enter, no cursor jump)
+document.getElementById('boatsList').addEventListener('change', e=>{
+  if (!e.target.classList.contains('edit-name')) return;
+  const id=e.target.dataset.id, newName=e.target.value.trim();
+  if (!newName||!id) return;
+  const boat=state.boats.find(b=>b.id===id);
+  if (!boat||boat.name===newName) return;
+  boat.name=newName;
+  saveState(); renderEntryUI();
+});
+
+// handicap: event delegation (no re-render, no cursor jump)
+document.getElementById('boatThrowoutList').addEventListener('input', e=>{
+  if (!e.target.classList.contains('bt-input')) return;
+  const id=e.target.dataset.id, val=e.target.value;
+  const boat=state.boats.find(b=>b.id===id);
+  if (!boat) return;
+  boat.throwoutOverride = val===''?null:parseInt(val);
+  saveState();
+});
+
+function renderBoatThrowoutList(){
+  const panel=document.getElementById('handicapPanel');
+  const list=document.getElementById('boatThrowoutList');
+  if (!state.boats.length){panel.style.display='none';return;}
+  panel.style.display='block';
+  list.innerHTML=state.boats.map(b=>{
+    const ov=b.throwoutOverride!=null?b.throwoutOverride:'';
+    return `<div class="boat-throwout-item">
+      <span class="bt-name">${escHtml(b.name)}</span>
+      <input type="number" class="bt-input" data-id="${b.id}" min="0" max="20" value="${ov}" placeholder="">
+    </div>`;
+  }).join('');
+}
+
+// ── ENTRY ──────────────────────────────────────────────────────────────────
+function resetEntrySession(){
+  document.getElementById('raceNumLabel').textContent=`RACE #${state.races.length+1}`;
+  const lastRace=state.races.length>0?state.races[state.races.length-1]:null;
+  document.getElementById('entryWindSelects').innerHTML=windSelectsHTML('entryWindSpeed','entryWindDir',lastRace?.windSpeed??'',lastRace?.windDir??'');
+  currentRanked=[]; currentUnranked=state.boats.map(b=>b.id);
+  const has=state.boats.length>0;
+  document.getElementById('entryArea').style.display=has?'block':'none';
+  document.getElementById('entryEmpty').style.display=has?'none':'block';
+  document.getElementById('saveBtn').disabled=!has;
+  renderEntryUI();
+}
+
+function boatName(id){const b=state.boats.find(b=>b.id===id);return b?b.name:id;}
+
+function renderEntryUI(){
+  if (!state.boats.length) return;
+  document.getElementById('progressBar').style.width=Math.round(currentRanked.length/state.boats.length*100)+'%';
+  const penalties=['DNS','DNC','OCS','DNF','RET','DSQ','BFD','UFD','DNE','ZFP'];
+  const pool=document.getElementById('unrankedPool');
+  pool.innerHTML=currentUnranked.length===0
+    ?`<div style="color:var(--green);font-size:0.8rem;padding:0.45rem 0;">${t('allDone')}</div>`
+    :currentUnranked.map(id=>`
+      <div class="boat-btn" onclick="tapBoat('${id}')">
+        <span class="boat-dot"></span>
+        <span style="flex:1">${escHtml(boatName(id))}</span>
+        <select class="penalty-select" id="ps_${id}" onclick="event.stopPropagation()" onchange="onPenaltyChange('${id}',this.value)">
+          <option value="">${LANG==='en'?'Rank':'順位'}</option>
+          ${penalties.map(p=>`<option value="${p}">${p}</option>`).join('')}
+        </select>
+        <span class="tap-hint">${t('tapHint')}</span>
+      </div>`).join('');
+  const list=document.getElementById('rankedList');
+  if (!currentRanked.length){list.innerHTML=`<div style="color:var(--muted);font-size:0.78rem;padding:0.35rem 0;">${t('noFinish')}</div>`;return;}
+  let fp=0;
+  list.innerHTML=currentRanked.map((item,idx)=>{
+    const isP=PENALTY_STATUSES.includes(item.status);
+    if(!isP) fp++;
+    const dr=isP?'—':fp;
+    const rc=fp===1?'rank-1-c':fp===2?'rank-2-c':fp===3?'rank-3-c':'rank-n-c';
+    return `<div class="ranked-item">
+      <span class="rank-num ${isP?'rank-n-c':rc}">${dr}</span>
+      <span class="ranked-boat-name">${escHtml(boatName(item.boatId))}</span>
+      <select class="penalty-select" onchange="changeRankedStatus(${idx},this.value)">
+        <option value="">—</option>
+        ${penalties.map(p=>`<option value="${p}" ${item.status===p?'selected':''}>${p}</option>`).join('')}
+      </select>
+      <button class="undo-btn" onclick="undoRanked(${idx})">✕</button>
+    </div>`;
+  }).join('');
+}
+
+function tapBoat(id){
+  const psEl=document.getElementById(`ps_${id}`);
+  currentUnranked=currentUnranked.filter(x=>x!==id);
+  currentRanked.push({boatId:id,status:psEl?psEl.value:''});
+  renderEntryUI();
+}
+function onPenaltyChange(id,val){if(val!=='') setTimeout(()=>tapBoat(id),80);}
+function changeRankedStatus(idx,val){
+  currentRanked[idx].status=val;
+  renderEntryUI();
+}
+function undoRanked(idx){
+  const item=currentRanked.splice(idx,1)[0];
+  const orig=state.boats.map(b=>b.id);
+  currentUnranked.push(item.boatId);
+  currentUnranked.sort((a,b)=>orig.indexOf(a)-orig.indexOf(b));
+  renderEntryUI();
+}
+
+function saveRace(){
+  if (!state.boats.length) return;
+  if (currentUnranked.length>0){showToast(t('toastRemainingPre')+currentUnranked.length+t('toastRemainingPost'));return;}
+  let fp=0;
+  const entries=currentRanked.map(item=>{
+    const isP=PENALTY_STATUSES.includes(item.status);
+    if(!isP) fp++;
+    return{boatId:item.boatId,rank:isP?null:fp,status:item.status||''};
+  });
+  const windSpeed=document.getElementById('entryWindSpeed')?.value??'';
+  const windDir=document.getElementById('entryWindDir')?.value??'';
+  state.races.push({entries,windSpeed,windDir});
+  saveState(); resetEntrySession(); renderResults();
+  showToast(t('toastRaceSaved').replace('{n}',state.races.length));
+}
+
+// ── SCORING ────────────────────────────────────────────────────────────────
+function computeSeriesFor(st){
+  const globalT=st.throwouts||0, zfpPct=st.zfpPct||20, n=st.boats.length;
+  // 各レースでペナルティ艇を除いて実効順位を再計算（繰り上がり対応）
+  const effRankMaps=st.races.map(race=>{
+    const m=new Map();
+    race.entries
+      .filter(e=>!PENALTY_STATUSES.includes(e.status)&&e.rank!=null)
+      .sort((a,b)=>a.rank-b.rank)
+      .forEach((e,i)=>m.set(e.boatId,i+1));
+    return m;
+  });
+  const boatData=st.boats.map(b=>{
+    const raceScores=st.races.map((race,ri)=>{
+      const e=race.entries.find(e=>e.boatId===b.id);
+      if(!e) return n+1;
+      if(PENALTY_STATUSES.includes(e.status)) return n+1;
+      const effRank=effRankMaps[ri].get(b.id);
+      if(!effRank) return n+1;
+      if(e.status==='ZFP') return Math.min(Math.round(effRank*(1+zfpPct/100)*10)/10,n+1);
+      return effRank;
+    });
+    const nonExcIdx=new Set(st.races.map((race,ri)=>{
+      const e=race.entries.find(e=>e.boatId===b.id);
+      return(e&&NON_EXCLUDABLE.includes(e.status))?ri:-1;
+    }).filter(i=>i>=0));
+    return{boat:b,raceScores,nonExcIdx};
+  });
+  boatData.forEach(bd=>{
+    const t=bd.boat.throwoutOverride!=null?bd.boat.throwoutOverride:globalT;
+    const idx=bd.raceScores.map((s,i)=>({s,i})).filter(x=>!bd.nonExcIdx.has(x.i)).sort((a,b)=>b.s-a.s);
+    bd.throwoutIndices=new Set(idx.slice(0,t).map(x=>x.i));
+    bd.netScore=bd.raceScores.reduce((sum,s,i)=>bd.throwoutIndices.has(i)?sum:sum+s,0);
+  });
+  boatData.sort((a,b)=>{
+    if(a.netScore!==b.netScore) return a.netScore-b.netScore;
+    const aS=a.raceScores.filter((_,i)=>!a.throwoutIndices.has(i)).sort((x,y)=>x-y);
+    const bS=b.raceScores.filter((_,i)=>!b.throwoutIndices.has(i)).sort((x,y)=>x-y);
+    for(let i=0;i<Math.max(aS.length,bS.length);i++){const d=(aS[i]??Infinity)-(bS[i]??Infinity);if(d!==0)return d;}
+    for(let r=st.races.length-1;r>=0;r--){const d=(a.raceScores[r]??Infinity)-(b.raceScores[r]??Infinity);if(d!==0)return d;}
+    return 0;
+  });
+  return boatData;
+}
+
+// ── BUILD RESULTS HTML ──────────────────────────────────────────────────────
+function buildResultsHTML(st, forExport=false){
+  if(!st.boats?.length||!st.races?.length) return '';
+  const series=computeSeriesFor(st);
+  const hd=series[0].raceScores.map((_,i)=>`<th>R${i+1}</th>`).join('');
+  const rows=series.map((bd,pos)=>{
+    const badge=pos===0?`<span class="rank-badge rank-1">1</span>`:pos===1?`<span class="rank-badge rank-2">2</span>`:pos===2?`<span class="rank-badge rank-3">3</span>`:`<span class="rank-badge rank-n">${pos+1}</span>`;
+    const cells=bd.raceScores.map((s,ri)=>{
+      const entry=st.races[ri].entries.find(e=>e.boatId===bd.boat.id);
+      const isT=bd.throwoutIndices.has(ri);
+      const st2=entry?.status||'';
+      let disp=s,b2='';
+      if(PENALTY_STATUSES.includes(st2)){b2=`<span class="status-badge s-${st2.toLowerCase()}">${st2}</span>`;disp='';}
+      else if(st2==='ZFP') b2=`<span class="status-badge s-zfp">ZFP</span>`;
+      return `<td class="score-cell${isT?' throwout':''}">${disp}${b2}</td>`;
+    }).join('');
+    return `<tr class="${pos===0?'winner':''}"><td>${badge}</td><td class="left">${escHtml(bd.boat.name)}</td>${cells}<td class="score-cell total">${bd.netScore}</td></tr>`;
+  }).join('');
+  let dateStr='';
+  if(st.dateFrom){dateStr=st.dateFrom;if(st.dateTo&&st.dateTo!==st.dateFrom)dateStr+=' 〜 '+st.dateTo;}
+  const title=forExport?`<div style="display:flex;align-items:flex-start;justify-content:space-between;margin-bottom:1rem;">
+    <div style="font-family:'Bebas Neue',sans-serif;font-size:1.4rem;letter-spacing:0.15em;color:#a8dadc;">⛵ ${escHtml(st.seriesName||t('exportTitle'))}</div>
+    ${dateStr?`<div style="font-family:'DM Mono',monospace;font-size:0.72rem;color:#4a6484;text-align:right;padding-top:0.3rem;">${escHtml(dateStr)}</div>`:''}
+  </div>`:'';
+  // 風向・風速セクション（同じテーブルのtfootに入れて列を揃える）
+  const hasWind = st.races.some(r => (r.windSpeed !== '' && r.windSpeed !== undefined && r.windSpeed !== null) || (r.windDir !== '' && r.windDir !== undefined && r.windDir !== null));
+  const windTfoot = hasWind ? (() => {
+    const speedCells = st.races.map(r => {
+      const sp = r.windSpeed !== undefined && r.windSpeed !== '' && r.windSpeed !== null ? (r.windSpeed === '無風' ? '無風' : r.windSpeed + ' m/s') : '—';
+      return `<td class="score-cell" style="font-size:0.75rem;white-space:nowrap;text-align:right;">${sp}</td>`;
+    }).join('');
+    const dirCells = st.races.map(r => {
+      const dr = r.windDir !== undefined && r.windDir !== '' && r.windDir !== null ? (() => { const d = WIND_DIRS.find(x => String(x.deg) === String(r.windDir)); return d ? `${r.windDir}°<br>（${d.label}）` : '—'; })() : '—';
+      return `<td class="score-cell" style="font-size:0.72rem;color:var(--muted);white-space:nowrap;text-align:right;">${dr}</td>`;
+    }).join('');
+    return `<tfoot>
+      <tr style="border-top:2px solid var(--border);">
+        <td colspan="2" style="padding:0;"></td>
+        ${st.races.map((_,i)=>`<td></td>`).join('')}
+        <td></td>
+      </tr>
+      <tr>
+        <td></td>
+        <td class="left" style="font-size:0.72rem;color:var(--muted);white-space:nowrap;">💨 風速</td>
+        ${speedCells}
+        <td></td>
+      </tr>
+      <tr>
+        <td></td>
+        <td class="left" style="font-size:0.72rem;color:var(--muted);white-space:nowrap;">🧭 風向</td>
+        ${dirCells}
+        <td></td>
+      </tr>
+    </tfoot>`;
+  })() : '';
+  return `${title}<table><thead><tr><th style="width:34px">#</th><th class="left">${t('colBoat')}</th>${hd}<th>${t('colTotal')}</th></tr></thead><tbody>${rows}</tbody>${windTfoot}</table>`;
+}
+
+function renderResults(){
+  const el=document.getElementById('resultsTable');
+  el.innerHTML=buildResultsHTML(state)||`<div class="empty"><div class="empty-icon">📊</div>${t('resultsEmpty')}</div>`;
+}
+
+// ── PNG ────────────────────────────────────────────────────────────────────
+async function exportPNG(){
+  if(!state.races.length){showToast(t('toastNoData'));return;}
+  showToast(t('toastPngGen'));
+  const isLight=document.body.classList.contains('light');
+  const pngBg=isLight?'#f0f4f8':'#0a1628';
+  const cap=document.getElementById('pngCapture');
+  cap.innerHTML=buildResultsHTML(state,true);
+  cap.style.cssText=`position:fixed;left:-9999px;top:0;background:${pngBg};padding:24px;min-width:600px;`;
+  try{
+    const canvas=await html2canvas(cap,{backgroundColor:pngBg,scale:2,useCORS:true,logging:false,onclone:(doc)=>{const el=doc.getElementById('pngCapture');el.style.position='absolute';el.style.left='0';el.style.top='0';}});
+    const a=document.createElement('a');
+    a.href=canvas.toDataURL('image/png');
+    a.download=(state.seriesName||'regatta')+'_results.png';
+    a.click();
+    showToast(t('toastPngSaved'));
+  }catch(e){showToast(t('toastPngFail'));}
+  finally{cap.style.cssText='position:fixed;left:-9999px;top:0;background:#0a1628;padding:24px;min-width:600px;z-index:-1;';cap.innerHTML='';}
+}
+
+async function copyPNG(){
+  if(!state.races.length){showToast(t('toastNoData'));return;}
+  showToast(t('toastPngGen'));
+  const isLight=document.body.classList.contains('light');
+  const pngBg=isLight?'#f0f4f8':'#0a1628';
+  const cap=document.getElementById('pngCapture');
+  cap.innerHTML=buildResultsHTML(state,true);
+  cap.style.cssText=`position:fixed;left:-9999px;top:0;background:${pngBg};padding:24px;min-width:600px;`;
+  try{
+    const canvas=await html2canvas(cap,{backgroundColor:pngBg,scale:2,useCORS:true,logging:false,onclone:(doc)=>{const el=doc.getElementById('pngCapture');el.style.position='absolute';el.style.left='0';el.style.top='0';}});
+    const dataUrl=canvas.toDataURL('image/png');
+    canvas.toBlob(async blob=>{
+      const file=new File([blob],(state.seriesName||'regatta')+'_results.png',{type:'image/png'});
+      // 1. Web Share API（スマホ優先：ネイティブ共有シートが開く）
+      if(navigator.share && navigator.canShare?.({files:[file]})){
+        try{
+          const dateRange=state.dateFrom?(state.dateTo&&state.dateTo!==state.dateFrom?`${state.dateFrom}〜${state.dateTo}`:state.dateFrom):'';
+        const shareTitle=(state.seriesName||'成績表')+(dateRange?`（${dateRange}）`:'');
+        await navigator.share({files:[file],title:shareTitle});
+          showToast(t('toastShared'));
+          return;
+        }catch(e){ if(e.name==='AbortError') return; }
+      }
+      try{
+        await navigator.clipboard.write([new ClipboardItem({'image/png':blob})]);
+        showToast(t('toastCopied'));
+        return;
+      }catch(e){}
+      const w=window.open('','_blank');
+      if(w){
+        w.document.write(`<html><body style="margin:0;background:#000;"><img src="${dataUrl}" style="max-width:100%;"></body></html>`);
+        w.document.close();
+        showToast(t('toastNewTab'));
+      }else{ showToast(t('toastShareFail')); }
+    },'image/png');
+  }catch(e){showToast(t('toastPngFail'));}
+  finally{cap.style.cssText='position:fixed;left:-9999px;top:0;background:#0a1628;padding:24px;min-width:600px;z-index:-1;';cap.innerHTML='';}
+}
+
+// ── PAST RACES ──────────────────────────────────────────────────────────────
+function openRaceListModal(){
+  const el=document.getElementById('raceListContent');
+  el.innerHTML=!state.races.length?`<div class="empty"><div class="empty-icon">🌊</div>${t('noFinish')}</div>`
+    :state.races.map((r,i)=>{
+      const top=r.entries.filter(e=>e.rank===1).map(e=>boatName(e.boatId)).join(', ');
+      const wl=windLabel(r.windSpeed,r.windDir);
+      const commentHtml=wl?`<span class="race-comment">💨 ${escHtml(wl)}</span>`:'';
+      return `<div class="race-card"><div class="race-card-info"><span class="race-pill">${t('racePill')} ${i+1}</span><span class="race-summary">${t('race1st')}${top||'—'} ／ ${r.entries.length}${t('raceBoats')}</span>${commentHtml}</div><button class="btn btn-secondary" onclick="openEditRace(${i})">${LANG==='en'?'Edit':'編集'}</button></div>`;
+    }).join('');
+  document.getElementById('raceListModal').classList.add('open');
+}
+function closeRaceListModal(){document.getElementById('raceListModal').classList.remove('open');}
+
+function openEditRace(i){
+  editingRaceIndex=i;
+  document.getElementById('editRaceTitle').textContent=`${t('racePill')} ${i+1} ${LANG==='en'?'Edit':'編集'}`;
+  const race=state.races[i];
+  document.getElementById('editWindSelectsWrap').innerHTML=windSelectsHTML('editWindSpeed','editWindDir',race.windSpeed??'',race.windDir??'');
+  document.getElementById('editRaceForm').innerHTML=race.entries.map((e,j)=>`
+    <div class="edit-row">
+      <span class="edit-boat-name">${escHtml(boatName(e.boatId))}</span>
+      <input type="number" class="edit-rank-input" id="er_${j}" value="${e.rank||''}" min="1" placeholder="順位" style="width:60px;flex-shrink:0;">
+      <select class="edit-status-select" id="es_${j}" style="width:80px;flex-shrink:0;">
+        <option value="">—</option>
+        ${['DNS','DNC','OCS','DNF','RET','DSQ','BFD','UFD','DNE','ZFP'].map(s=>`<option value="${s}" ${e.status===s?'selected':''}>${s}</option>`).join('')}
+      </select>
+    </div>`).join('');
+  closeRaceListModal();
+  document.getElementById('editRaceModal').classList.add('open');
+}
+function closeEditRace(){document.getElementById('editRaceModal').classList.remove('open');editingRaceIndex=null;}
+function saveEditRace(){
+  if(editingRaceIndex===null) return;
+  state.races[editingRaceIndex].windSpeed=document.getElementById('editWindSpeed')?.value??'';
+  state.races[editingRaceIndex].windDir=document.getElementById('editWindDir')?.value??'';
+  state.races[editingRaceIndex].entries.forEach((e,j)=>{
+    e.rank=parseInt(document.getElementById(`er_${j}`).value)||null;
+    e.status=document.getElementById(`es_${j}`).value;
+  });
+  saveState();renderResults();closeEditRace();
+  showToast(t('toastRaceUpdated').replace('{n}',editingRaceIndex+1));
+}
+function deleteRace(){
+  if(editingRaceIndex===null) return;
+  if(!confirm(t('confirmDeleteRace').replace('{n}',editingRaceIndex+1))) return;
+  state.races.splice(editingRaceIndex,1);
+  saveState();resetEntrySession();renderResults();closeEditRace();
+  showToast(t('toastRaceDeleted'));
+}
+
+// ── CLOUD MODAL ────────────────────────────────────────────────────────────
+function openCloudModal(){
+  document.getElementById('cloudModal').classList.add('open');
+  switchCloudTab('save');
+}
+function closeCloudModal(){document.getElementById('cloudModal').classList.remove('open');}
+function switchCloudTab(name){
+  ['save','list'].forEach((n,i)=>{
+    document.querySelectorAll('.cloud-tab')[i].classList.toggle('active',n===name);
+    document.getElementById('ctab-'+n).classList.toggle('active',n===name);
+  });
+  if(name==='list' && typeof renderEventList==='function') renderEventList();
+}
+
+// ── TABS ───────────────────────────────────────────────────────────────────
+function switchTab(name){
+  ['setup','entry','results'].forEach((n,i)=>{
+    document.querySelectorAll('.tab')[i].classList.toggle('active',n===name);
+    document.getElementById('tab-'+n).classList.toggle('active',n===name);
+  });
+  if(name==='results') renderResults();
+}
+
+// ── UTILS ──────────────────────────────────────────────────────────────────
+function escHtml(s){return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');}
+let toastTimer;
+function showToast(msg){const el=document.getElementById('toast');el.textContent=msg;el.classList.add('show');clearTimeout(toastTimer);toastTimer=setTimeout(()=>el.classList.remove('show'),2800);}
+
+// initial render (before Firebase loads)
+applyTranslations();
+updateThrowoutInfo();
+renderResults();
+
+// flatpickr カレンダー初期化
+var fpFrom = flatpickr('#dateFrom', {
+  dateFormat: 'Y/m/d',
+  locale: { firstDayOfWeek: 1 },
+  onChange: function(dates, dateStr) {
+    if (dateStr && fpTo) {
+      const toDate = fpTo.selectedDates[0];
+      if (!toDate || toDate < dates[0]) fpTo.setDate(dateStr);
+    }
+    saveState();
+  }
+});
+var fpTo = flatpickr('#dateTo', {
+  dateFormat: 'Y/m/d',
+  locale: { firstDayOfWeek: 1 },
+  onChange: function() { saveState(); }
+});
+</script>
+</body>
+</html>

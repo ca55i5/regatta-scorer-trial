@@ -474,8 +474,12 @@ tr.winner td.left{color:var(--gold);font-weight:500;}
     <div class="panel">
       <div class="panel-title" data-i18n="boatsTitle">参加艇登録</div>
       <div class="add-row">
-        <input type="text" id="boatInput" placeholder="艇名を入力" data-i18n-placeholder="boatPlaceholder" onkeydown="if(event.key==='Enter')addBoat()">
+        <input type="text" id="boatInput" placeholder="艇名を入力（カンマ区切り）" data-i18n-placeholder="boatPlaceholder" onkeydown="if(event.key==='Enter')addBoat()">
         <button class="btn btn-primary" onclick="addBoat()" data-i18n="boatAdd">追加</button>
+      </div>
+      <div style="margin-top:0.4rem;">
+        <input type="file" id="boatFileInput" accept=".txt,.csv" style="display:none" onchange="loadBoatFile(event)">
+        <button class="btn btn-secondary" style="font-size:0.78rem;padding:0.3rem 0.7rem;" onclick="document.getElementById('boatFileInput').click()" data-i18n="boatFileBtn">📂 ファイルから読込（改行区切り）</button>
       </div>
       <div class="boats-list" id="boatsList"></div>
     </div>
@@ -504,6 +508,12 @@ tr.winner td.left{color:var(--gold);font-weight:500;}
         <div class="finish-layout">
           <div>
             <div class="finish-section-label" data-i18n="tapLabel">タップして順位をつける ↓</div>
+            <div style="display:flex;gap:0.4rem;margin-bottom:0.5rem;">
+              <input type="text" id="commaRankInput" placeholder="艇名をカンマ区切りで着順入力" data-i18n-placeholder="commaRankPlaceholder" style="flex:1;font-size:0.8rem;padding:0.35rem 0.5rem;background:var(--input-bg);border:1px solid var(--border);border-radius:6px;color:var(--salt);" onkeydown="if(event.key==='Enter')applyCommaRank()">
+              <button class="btn btn-secondary" style="font-size:0.78rem;padding:0.3rem 0.7rem;white-space:nowrap;" onclick="applyCommaRank()" data-i18n="commaRankApply">適用</button>
+              <input type="file" id="rankFileInput" accept=".txt,.csv" style="display:none" onchange="loadRankFile(event)">
+              <button class="btn btn-secondary" style="font-size:0.78rem;padding:0.3rem 0.7rem;white-space:nowrap;" onclick="document.getElementById('rankFileInput').click()">📂</button>
+            </div>
             <div class="unranked-pool" id="unrankedPool"></div>
           </div>
           <div>
@@ -659,7 +669,11 @@ const TX = {
     headerCloud:'☁ 大会',headerReset:'リセット',
     setupTitle:'シリーズ設定',labelName:'大会名',namePlaceholder:'2025 Summer Series',
     labelThrowouts:'捨てレース数（Throwout）',labelDateFrom:'開始日',labelDateTo:'終了日',
-    boatsTitle:'参加艇登録',boatPlaceholder:'艇名を入力',boatAdd:'追加',boatEmpty:'まだ登録されていません',
+    boatsTitle:'参加艇登録',boatPlaceholder:'艇名を入力（カンマ区切り）',boatAdd:'追加',boatEmpty:'まだ登録されていません',
+    boatFileBtn:'📂 ファイルから読込（改行区切り）',
+    commaRankPlaceholder:'艇名をカンマ区切りで着順入力',commaRankApply:'適用',
+    blankBoatSelect:'— 艇を選択（{label}）—',
+    toastBlankRemaining:'未割り当てのブランク艇が{n}艇あります',toastBoatsLoaded:'{n}艇を登録しました',
     handicapTitle:'個別捨てレース設定',handicapNote:'空欄の場合は「捨てレース数」に設定した数を適用します。',
     entryEditBtn:'RACE着順編集',entrySaveBtn:'保存',
     tapLabel:'タップして順位をつける ↓',finishLabel:'フィニッシュ順',tapHint:'TAP→',
@@ -707,7 +721,11 @@ const TX = {
     headerCloud:'☁ Events',headerReset:'Reset',
     setupTitle:'Series Settings',labelName:'Event Name',namePlaceholder:'2025 Summer Series',
     labelThrowouts:'Throwouts',labelDateFrom:'Start Date',labelDateTo:'End Date',
-    boatsTitle:'Boat Registration',boatPlaceholder:'Enter boat name',boatAdd:'Add',boatEmpty:'No boats registered yet',
+    boatsTitle:'Boat Registration',boatPlaceholder:'Enter boat name(s) (comma-separated)',boatAdd:'Add',boatEmpty:'No boats registered yet',
+    boatFileBtn:'📂 Load from file (line-separated)',
+    commaRankPlaceholder:'Enter boat names in finishing order (comma-separated)',commaRankApply:'Apply',
+    blankBoatSelect:'— Select boat ({label}) —',
+    toastBlankRemaining:'{n} blank boat(s) unassigned',toastBoatsLoaded:'{n} boat(s) registered',
     handicapTitle:'Individual Throwout Settings',handicapNote:'If blank, the global throwout setting applies.',
     entryEditBtn:'Edit Race Results',entrySaveBtn:'Save',
     tapLabel:'Tap to assign finishing order ↓',finishLabel:'Finish Order',tapHint:'TAP→',
@@ -841,13 +859,40 @@ function genId(){return 'b'+Date.now()+Math.random().toString(36).slice(2,5);}
 
 function addBoat(){
   const inp=document.getElementById('boatInput');
-  const name=inp.value.trim();
-  if (!name) return;
-  if (state.boats.some(b=>b.name===name)){showToast(t('toastDupName'));return;}
-  state.boats.push({id:genId(),name,throwoutOverride:null});
+  const names=inp.value.split(',').map(n=>n.trim()).filter(Boolean);
+  if(!names.length) return;
+  let added=0,dup=0;
+  names.forEach(name=>{
+    if(state.boats.some(b=>b.name===name)){dup++;return;}
+    state.boats.push({id:genId(),name,throwoutOverride:null});
+    added++;
+  });
+  state.boats.sort((a,b)=>a.name.localeCompare(b.name,'ja'));
   inp.value='';
-  saveState(); renderBoatsList(); resetEntrySession();
+  if(dup>0) showToast(t('toastDupName'));
+  if(added>0){saveState(); renderBoatsList(); resetEntrySession();}
 }
+
+function loadBoatFile(e){
+  const file=e.target.files[0];
+  if(!file) return;
+  const reader=new FileReader();
+  reader.onload=ev=>{
+    const names=ev.target.result.split(/\r?\n/).map(n=>n.trim()).filter(Boolean);
+    let added=0;
+    names.forEach(name=>{
+      if(state.boats.some(b=>b.name===name)) return;
+      state.boats.push({id:genId(),name,throwoutOverride:null});
+      added++;
+    });
+    state.boats.sort((a,b)=>a.name.localeCompare(b.name,'ja'));
+    e.target.value='';
+    if(added>0){saveState(); renderBoatsList(); resetEntrySession();}
+    showToast(t('toastBoatsLoaded').replace('{n}',added));
+  };
+  reader.readAsText(file,'UTF-8');
+}
+window.loadBoatFile=loadBoatFile;
 
 function removeBoat(id){
   if (state.races.length>0){showToast(t('toastNoBothBoats'));return;}
@@ -862,7 +907,8 @@ function renderBoatsList(){
     document.getElementById('handicapPanel').style.display='none';
     return;
   }
-  el.innerHTML=state.boats.map(b=>`
+  const sorted=[...state.boats].sort((a,b)=>a.name.localeCompare(b.name,'ja'));
+  el.innerHTML=sorted.map(b=>`
     <div class="boat-tag">
       <span style="width:7px;height:7px;border-radius:50%;background:var(--foam);flex-shrink:0;display:inline-block;"></span>
       <input class="edit-name" type="text" value="${escHtml(b.name)}" data-id="${b.id}" title="クリックして編集">
@@ -911,7 +957,7 @@ function resetEntrySession(){
   document.getElementById('raceNumLabel').textContent=`RACE #${state.races.length+1}`;
   const lastRace=state.races.length>0?state.races[state.races.length-1]:null;
   document.getElementById('entryWindSelects').innerHTML=windSelectsHTML('entryWindSpeed','entryWindDir',lastRace?.windSpeed??'',lastRace?.windDir??'');
-  currentRanked=[]; currentUnranked=state.boats.map(b=>b.id);
+  currentRanked=[]; currentUnranked=[...state.boats].sort((a,b)=>a.name.localeCompare(b.name,'ja')).map(b=>b.id);
   const has=state.boats.length>0;
   document.getElementById('entryArea').style.display=has?'block':'none';
   document.getElementById('entryEmpty').style.display=has?'none':'block';
@@ -942,6 +988,19 @@ function renderEntryUI(){
   if (!currentRanked.length){list.innerHTML=`<div style="color:var(--muted);font-size:0.78rem;padding:0.35rem 0;">${t('noFinish')}</div>`;return;}
   let fp=0;
   list.innerHTML=currentRanked.map((item,idx)=>{
+    if(item.boatId===null){
+      // ブランク艇：登録済み艇のドロップダウンで選択
+      const opts=currentUnranked.map(id=>`<option value="${id}">${escHtml(boatName(id))}</option>`).join('');
+      fp++;
+      return `<div class="ranked-item" style="border-left:2px solid var(--gold);">
+        <span class="rank-num rank-n-c">${fp}</span>
+        <select class="penalty-select" style="flex:1;font-size:0.8rem;" onchange="assignBlankRank(${idx},this.value)">
+          <option value="">${escHtml(t('blankBoatSelect').replace('{label}',item.blankLabel||'?'))}</option>
+          ${opts}
+        </select>
+        <button class="undo-btn" onclick="undoRanked(${idx})">✕</button>
+      </div>`;
+    }
     const isP=PENALTY_STATUSES.includes(item.status);
     if(!isP) fp++;
     const dr=isP?'—':fp;
@@ -958,6 +1017,58 @@ function renderEntryUI(){
   }).join('');
 }
 
+function applyCommaRank(){
+  const val=document.getElementById('commaRankInput').value.trim();
+  if(!val) return;
+  const names=val.split(',').map(n=>n.trim()).filter(Boolean);
+  currentRanked=[];
+  currentUnranked=[...state.boats].sort((a,b)=>a.name.localeCompare(b.name,'ja')).map(b=>b.id);
+  names.forEach(name=>{
+    const boat=state.boats.find(b=>b.name===name);
+    if(boat && currentUnranked.includes(boat.id)){
+      currentUnranked=currentUnranked.filter(x=>x!==boat.id);
+      currentRanked.push({boatId:boat.id,status:''});
+    } else {
+      currentRanked.push({boatId:null,status:'',blankLabel:name});
+    }
+  });
+  renderEntryUI();
+}
+window.applyCommaRank=applyCommaRank;
+
+function loadRankFile(e){
+  const file=e.target.files[0];
+  if(!file) return;
+  const reader=new FileReader();
+  reader.onload=ev=>{
+    const names=ev.target.result.split(/\r?\n/).map(n=>n.trim()).filter(Boolean);
+    document.getElementById('commaRankInput').value=names.join(',');
+    currentRanked=[];
+    currentUnranked=[...state.boats].sort((a,b)=>a.name.localeCompare(b.name,'ja')).map(b=>b.id);
+    names.forEach(name=>{
+      const boat=state.boats.find(b=>b.name===name);
+      if(boat && currentUnranked.includes(boat.id)){
+        currentUnranked=currentUnranked.filter(x=>x!==boat.id);
+        currentRanked.push({boatId:boat.id,status:''});
+      } else {
+        currentRanked.push({boatId:null,status:'',blankLabel:name});
+      }
+    });
+    e.target.value='';
+    renderEntryUI();
+  };
+  reader.readAsText(file,'UTF-8');
+}
+window.loadRankFile=loadRankFile;
+
+function assignBlankRank(idx,boatId){
+  if(!boatId) return;
+  currentUnranked=currentUnranked.filter(x=>x!==boatId);
+  currentRanked[idx]={boatId,status:''};
+  renderEntryUI();
+}
+window.assignBlankRank=assignBlankRank;
+
 function tapBoat(id){
   const psEl=document.getElementById(`ps_${id}`);
   currentUnranked=currentUnranked.filter(x=>x!==id);
@@ -971,15 +1082,19 @@ function changeRankedStatus(idx,val){
 }
 function undoRanked(idx){
   const item=currentRanked.splice(idx,1)[0];
-  const orig=state.boats.map(b=>b.id);
-  currentUnranked.push(item.boatId);
-  currentUnranked.sort((a,b)=>orig.indexOf(a)-orig.indexOf(b));
+  if(item.boatId!==null){
+    const orig=[...state.boats].sort((a,b)=>a.name.localeCompare(b.name,'ja')).map(b=>b.id);
+    currentUnranked.push(item.boatId);
+    currentUnranked.sort((a,b)=>orig.indexOf(a)-orig.indexOf(b));
+  }
   renderEntryUI();
 }
 
 function saveRace(){
   if (!state.boats.length) return;
   if (currentUnranked.length>0){showToast(t('toastRemainingPre')+currentUnranked.length+t('toastRemainingPost'));return;}
+  const blanks=currentRanked.filter(item=>item.boatId===null).length;
+  if(blanks>0){showToast(t('toastBlankRemaining').replace('{n}',blanks));return;}
   let fp=0;
   const entries=currentRanked.map(item=>{
     const isP=PENALTY_STATUSES.includes(item.status);
